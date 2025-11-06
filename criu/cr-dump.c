@@ -88,6 +88,7 @@
 #include "asm/dump.h"
 #include "timer.h"
 #include "sigact.h"
+#include "mem-dump.h"
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -578,7 +579,19 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat, const struc
 	if (dump_task_exe_link(pid, &mme))
 		goto err;
 
-	ret = pb_write_one(img_from_set(imgset, CR_FD_MM), &mme, PB_MM);
+	/*
+	 * 修改点：使用内存 dump 代替文件写入
+	 * 原代码: ret = pb_write_one(img_from_set(imgset, CR_FD_MM), &mme, PB_MM);
+	 * 新代码: 直接将数据序列化到内存中
+	 */
+	pr_info("Writing MM entry to memory (pid: %d)\n", pid);
+	ret = mem_dump_write_pb(pid, CR_FD_MM, &mme, PB_MM);
+	if (ret < 0) {
+		pr_err("Failed to dump MM to memory (pid: %d)\n", pid);
+	} else {
+		pr_info("Successfully dumped MM to memory (pid: %d)\n", pid);
+	}
+
 	xfree(mme.mm_saved_auxv);
 	free_aios(&mme);
 err:
@@ -2148,6 +2161,16 @@ int cr_dump_tasks(pid_t pid)
 	pr_info("========================================\n");
 
 	/*
+	 * 初始化内存 dump 管理器
+	 * 这将替代原来写入文件的方式，所有 dump 数据都存储在内存中
+	 */
+	pr_info("Initializing memory dump manager\n");
+	if (mem_dump_init() < 0) {
+		pr_err("Failed to initialize memory dump manager\n");
+		goto err;
+	}
+
+	/*
 	 *  We will fetch all file descriptors for each task, their number can
 	 *  be bigger than a default file limit, so we need to raise it to the
 	 *  maximum.
@@ -2242,6 +2265,7 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_and_suspend_lsm() < 0)
 		goto err;
 
+	// Pre-Task 资源导出
 	for_each_pstree_item(item) {
 		if (dump_one_task(item, parent_ie))
 			goto err;
@@ -2251,6 +2275,8 @@ int cr_dump_tasks(pid_t pid)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 		parent_ie = NULL;
 	}
+
+	// 全局资源导出
 
 	/*
 	 * It may happen that a process has completed but its files in
@@ -2327,9 +2353,40 @@ int cr_dump_tasks(pid_t pid)
 	ret = write_img_inventory(&he);
 	if (ret)
 		goto err;
+
+	/*
+	 * 在 dump 成功后，显示内存 dump 统计信息
+	 */
+	if (ret == 0) {
+		pr_info("\n");
+		mem_dump_show_stats();
+		pr_info("\n");
+	}
+
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 
+	/*
+	 * 注意：这里我们暂时不清理内存 dump 管理器
+	 * 因为后续可能需要使用这些数据进行恢复操作
+	 * 如果确定不再需要，可以在这里调用 mem_dump_fini()
+	 */
+	if (ret != 0) {
+		pr_err("Dump failed, cleaning up memory dump manager\n");
+		mem_dump_fini();
+	} else {
+		pr_info("Dump succeeded, memory dump data retained for potential restore\n");
+		/* 可选：导出到文件用于调试 */
+		if (opts.work_dir) {
+			char export_dir[PATH_MAX];
+			snprintf(export_dir, sizeof(export_dir), "%s/mem_dumps", opts.work_dir);
+			pr_info("Exporting memory dumps to: %s\n", export_dir);
+			/* 这里可以选择性地导出，取决于是否需要持久化 */
+			// mem_dump_export_to_files(export_dir);
+		}
+	}
+
 	return cr_dump_finish(ret);
 }
+
