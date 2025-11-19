@@ -1501,6 +1501,35 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	}
 
 	/*
+	 * CXL mode: pages are stored in CXL memory pool, not in pages.img file.
+	 * No file descriptor needed - the restorer will read from CXL memory directly.
+	 */
+	if (opts.use_cxl_mem) {
+		char *cxl_path;
+		size_t path_len;
+
+		pr_info("CXL restore mode: skipping pages.img, will read from CXL memory pool\n");
+
+		/* Store position before allocating for remapping */
+		ta->cxl_dax_dev_path_pos = rst_mem_align_cpos(RM_PRIVATE);
+
+		/* Allocate and copy CXL device path to restore memory */
+		path_len = strlen(opts.cxl_dax_dev_path) + 1;
+		cxl_path = rst_mem_alloc(path_len, RM_PRIVATE);
+		if (!cxl_path) {
+			pr_err("Failed to allocate memory for CXL device path\n");
+			return -1;
+		}
+		strcpy(cxl_path, opts.cxl_dax_dev_path);
+
+		ta->vma_ios_fd = -1;
+		ta->use_cxl_restore = 1;
+		ta->cxl_dax_dev_path = cxl_path;
+		ta->cxl_pool_size = opts.cxl_mem_pool_size;
+		return pagemap_render_iovec(&rsti(t)->vma_io, ta);
+	}
+
+	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
 	 * the input files (in restorer.c)
 	 */

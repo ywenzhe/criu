@@ -705,6 +705,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
+		BOOL_OPT("cxl-mem", &opts.use_cxl_mem),
+		{ "cxl-dax", required_argument, 0, 1101 },
+		{ "cxl-pool-size", required_argument, 0, 1102 },
 		{},
 	};
 
@@ -1045,6 +1048,16 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			break;
+		case 1101: /* --cxl-dax */
+			SET_CHAR_OPTS(cxl_dax_dev_path, optarg);
+			break;
+		case 1102: /* --cxl-pool-size */
+			opts.cxl_mem_pool_size = parse_size(optarg);
+			if (opts.cxl_mem_pool_size == 0) {
+				pr_err("Invalid CXL pool size: %s\n", optarg);
+				return 1;
+			}
+			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -1134,6 +1147,31 @@ int check_options(void)
 	if (check_namespace_opts()) {
 		pr_err("Error: namespace flags conflict\n");
 		return 1;
+	}
+
+	/* CXL memory options validation */
+	if (opts.use_cxl_mem) {
+		pr_info("CXL memory mode enabled\n");
+		pr_info("  CXL DAX device: %s\n", opts.cxl_dax_dev_path ? opts.cxl_dax_dev_path : "(not set)");
+		pr_info("  CXL pool size: %zu bytes (%.2f GB)\n", opts.cxl_mem_pool_size,
+			(double)opts.cxl_mem_pool_size / (1024 * 1024 * 1024));
+
+		if (!opts.cxl_dax_dev_path) {
+			pr_err("--cxl-mem requires --cxl-dax to specify DAX device path\n");
+			return 1;
+		}
+
+		if (opts.cxl_mem_pool_size == 0) {
+			pr_err("--cxl-mem requires --cxl-pool-size to specify pool size\n");
+			pr_err("Example: --cxl-pool-size=16G\n");
+			return 1;
+		}
+
+		if (opts.lazy_pages) {
+			pr_err("--cxl-mem is incompatible with --lazy-pages\n");
+			pr_err("CXL memory mode cannot be used with lazy-pages (uffd) mode\n");
+			return 1;
+		}
 	}
 
 	return 0;

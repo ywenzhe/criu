@@ -247,6 +247,11 @@ struct cr_options {
 	 * explicitly request it as it comes with many limitations.
 	 */
 	int unprivileged;
+
+	/* CXL memory pool options */
+	int use_cxl_mem;	  /* Enable CXL memory mode for checkpoint/restore */
+	char *cxl_dax_dev_path;	  /* Path to DAX device (e.g., "/dev/dax0.0") */
+	size_t cxl_mem_pool_size; /* Size of CXL memory pool (bytes) */
 };
 
 extern struct cr_options opts;

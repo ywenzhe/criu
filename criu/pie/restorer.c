@@ -1728,6 +1728,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	pid_t my_pid = sys_getpid();
 	rt_sigaction_t act;
 	bool has_vdso_proxy;
+	/* CXL restore variables */
+	int cxl_fd = -1;
+	void *cxl_base = NULL;
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len = args->bootstrap_len;
@@ -1889,6 +1892,31 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Now read the contents (if any)
 	 */
 
+	/* CXL mode: open and map CXL memory pool for reading */
+	if (args->use_cxl_restore) {
+		if (!args->cxl_dax_dev_path) {
+			pr_err("CXL restore enabled but device path is NULL\n");
+			goto core_restore_end;
+		}
+
+		pr_info("CXL restore: opening %s (size=%lu)\n", args->cxl_dax_dev_path, args->cxl_pool_size);
+
+		cxl_fd = sys_open(args->cxl_dax_dev_path, O_RDONLY, 0);
+		if (cxl_fd < 0) {
+			pr_err("Failed to open CXL DAX device %s: %d\n", args->cxl_dax_dev_path, cxl_fd);
+			goto core_restore_end;
+		}
+
+		cxl_base = (void *)sys_mmap(NULL, args->cxl_pool_size, PROT_READ, MAP_SHARED, cxl_fd, 0);
+		if (cxl_base == MAP_FAILED) {
+			pr_err("Failed to mmap CXL device: %p\n", cxl_base);
+			sys_close(cxl_fd);
+			cxl_fd = -1;
+			goto core_restore_end;
+		}
+		pr_info("CXL memory pool mapped at %p\n", cxl_base);
+	}
+
 	rio = args->vma_ios;
 	for (i = 0; i < args->vma_ios_n; i++) {
 		struct iovec *iovs = rio->iovs;
@@ -1896,46 +1924,89 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		ssize_t r;
 
 		while (nr) {
-			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
-			/*
-			 * If we're requested to punch holes in the file after reading we do
-			 * it to save memory. Limit the reads then to an arbitrary block size.
-			 */
-			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
-					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
-			if (r < 0) {
-				pr_err("Can't read pages data (%d)\n", (int)r);
-				goto core_restore_end;
-			}
+			if (args->use_cxl_restore) {
+				/* CXL mode: copy from CXL memory pool */
+				unsigned long total_len = 0;
+				int iov_idx;
 
-			pr_debug("`- returned %ld\n", (long)r);
-			/* If the file is open for writing, then it means we should punch holes
-			 * in it. */
-			if (r > 0 && args->auto_dedup) {
-				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       rio->off, r);
-				if (fr < 0) {
-					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
-				}
-			}
-			rio->off += r;
-			/* Advance the iovecs */
-			do {
-				if (iovs->iov_len <= r) {
-					pr_debug("   `- skip pagemap\n");
-					r -= iovs->iov_len;
-					iovs++;
-					nr--;
-					continue;
+				/* Calculate total length for this read */
+				for (iov_idx = 0; iov_idx < nr; iov_idx++)
+					total_len += iovs[iov_idx].iov_len;
+
+				pr_debug("CXL read from offset %lx: %lu bytes (%d iovs)\n",
+					 (unsigned long)rio->off, total_len, nr);
+
+				if (rio->off + total_len > args->cxl_pool_size) {
+					pr_err("CXL read out of bounds: offset %lx + len %lu > pool size %lu\n",
+					       (unsigned long)rio->off, total_len, args->cxl_pool_size);
+					goto core_restore_cxl_cleanup;
 				}
 
-				iovs->iov_base += r;
-				iovs->iov_len -= r;
-				break;
-			} while (nr > 0);
+				/* Copy from CXL memory to each iovec */
+				r = 0;
+				for (iov_idx = 0; iov_idx < nr; iov_idx++) {
+					memcpy(iovs[iov_idx].iov_base,
+					       (char *)cxl_base + rio->off + r,
+					       iovs[iov_idx].iov_len);
+					r += iovs[iov_idx].iov_len;
+				}
+
+				/* All iovecs processed */
+				nr = 0;
+			} else {
+				/* Traditional mode: read from file */
+				pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
+				/*
+				 * If we're requested to punch holes in the file after reading we do
+				 * it to save memory. Limit the reads then to an arbitrary block size.
+				 */
+				r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
+						   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
+				if (r < 0) {
+					pr_err("Can't read pages data (%d)\n", (int)r);
+					goto core_restore_end;
+				}
+
+				pr_debug("`- returned %ld\n", (long)r);
+				/* If the file is open for writing, then it means we should punch holes
+				 * in it. */
+				if (r > 0 && args->auto_dedup) {
+					int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+							       rio->off, r);
+					if (fr < 0) {
+						pr_debug("Failed to punch holes with fallocate: %d\n", fr);
+					}
+				}
+				rio->off += r;
+				/* Advance the iovecs */
+				do {
+					if (iovs->iov_len <= r) {
+						pr_debug("   `- skip pagemap\n");
+						r -= iovs->iov_len;
+						iovs++;
+						nr--;
+						continue;
+					}
+
+					iovs->iov_base += r;
+					iovs->iov_len -= r;
+					break;
+				} while (nr > 0);
+			}
 		}
 
 		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+	}
+
+	/* CXL cleanup */
+core_restore_cxl_cleanup:
+	if (args->use_cxl_restore) {
+		if (cxl_base != NULL && cxl_base != MAP_FAILED) {
+			sys_munmap(cxl_base, args->cxl_pool_size);
+		}
+		if (cxl_fd >= 0) {
+			sys_close(cxl_fd);
+		}
 	}
 
 	if (args->vma_ios_fd != -1)

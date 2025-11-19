@@ -3330,6 +3330,10 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
 	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
 
+	/* Remap CXL device path pointer if CXL restore is enabled */
+	if (task_args->use_cxl_restore && task_args->cxl_dax_dev_path_pos)
+		task_args->cxl_dax_dev_path = rst_mem_remap_ptr(task_args->cxl_dax_dev_path_pos, RM_PRIVATE);
+
 	task_args->compatible_mode = core_is_compat(core);
 	/*
 	 * Arguments for task restoration.

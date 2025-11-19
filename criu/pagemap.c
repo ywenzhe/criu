@@ -130,6 +130,15 @@ static int advance(struct page_read *pr)
 	pr->pe = pr->pmes[pr->curr_pme];
 	pr->cvaddr = pr->pe->vaddr;
 
+	/*
+	 * In CXL mode, reset pi_off to the new pagemap entry's explicit offset.
+	 * Within an entry, pi_off will increment normally as pages are read/skipped.
+	 */
+	if (opts.use_cxl_mem && pr->pe && pr->pe->has_cxl_pool_offset) {
+		pr->pi_off = pr->pe->cxl_pool_offset;
+		pr_debug("CXL: advanced to new pagemap entry, reset pi_off to %" PRIu64 "\n", pr->pi_off);
+	}
+
 	return 1;
 }
 
@@ -138,6 +147,11 @@ static void skip_pagemap_pages(struct page_read *pr, unsigned long len)
 	if (!len)
 		return;
 
+	/*
+	 * In CXL mode, pi_off tracks position within the current pagemap entry.
+	 * It's reset to cxl_pool_offset when advancing to a new entry (in advance()).
+	 * Within an entry, we increment pi_off as we skip pages.
+	 */
 	if (pagemap_present(pr->pe))
 		pr->pi_off += len;
 	pr->cvaddr += len;
@@ -274,13 +288,21 @@ static int enqueue_async_iov(struct page_read *pr, void *buf, unsigned long len,
 {
 	struct page_read_iov *pr_iov;
 	struct iovec *iov;
+	off_t offset;
 
 	pr_iov = xzalloc(sizeof(*pr_iov));
 	if (!pr_iov)
 		return -1;
 
-	pr_iov->from = pr->pi_off;
-	pr_iov->end = pr->pi_off + len;
+	/*
+	 * Use pi_off which tracks the current read position.
+	 * In CXL mode, pi_off is set to cxl_pool_offset when advancing to a new
+	 * pagemap entry, and increments as we read/skip pages within that entry.
+	 */
+	offset = pr->pi_off;
+
+	pr_iov->from = offset;
+	pr_iov->end = offset + len;
 
 	iov = xzalloc(sizeof(*iov));
 	if (!iov) {
@@ -328,6 +350,13 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
 {
 	struct page_read_iov *cur_async = NULL;
 	struct iovec *iov;
+
+	/*
+	 * CXL mode: each pagemap entry has independent offset, never merge.
+	 * Always create a new async request.
+	 */
+	if (opts.use_cxl_mem)
+		return enqueue_async_iov(pr, buf, len, to);
 
 	if (!list_empty(to))
 		cur_async = list_entry(to->prev, struct page_read_iov, l);
@@ -380,6 +409,13 @@ static int maybe_read_page_local(struct page_read *pr, unsigned long vaddr, unsi
 	unsigned long len = nr * PAGE_SIZE;
 
 	/*
+	 * In CXL mode, pi_off is set to cxl_pool_offset when advancing to a new pagemap
+	 * entry (see advance() function). Within an entry, pi_off increments normally as
+	 * we read pages. We don't reset it here - it maintains the running position within
+	 * the current pagemap entry.
+	 */
+
+	/*
 	 * There's no API in the kernel to start asynchronous
 	 * cached read (or write), so in case someone is asking
 	 * for us for urgent async read, just do the regular
@@ -393,6 +429,10 @@ static int maybe_read_page_local(struct page_read *pr, unsigned long vaddr, unsi
 			ret = pr->io_complete(pr, vaddr, nr);
 	}
 
+	/*
+	 * Always increment pi_off after reading/enqueueing, even in CXL mode.
+	 * This tracks our position within the current pagemap entry.
+	 */
 	pr->pi_off += len;
 
 	return ret;

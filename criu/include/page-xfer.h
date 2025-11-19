@@ -45,6 +45,10 @@ struct page_xfer {
 		};
 	};
 
+	/* CXL memory mode support */
+	bool use_cxl;		  /* Whether CXL mode is enabled for this xfer */
+	uint64_t last_cxl_offset; /* Last allocated CXL offset (for pagemap) */
+
 	struct page_read *parent;
 };
 

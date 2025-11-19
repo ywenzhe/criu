@@ -14,4 +14,9 @@ message pagemap_entry {
 	optional bool	in_parent	= 3;
 	optional uint32	flags		= 4 [(criu).flags = "pmap.flags" ];
 	optional uint64 nr_pages = 5;
+	/*
+	 * CXL memory pool offset (in bytes) where page data is stored
+	 * Only valid when CXL memory mode is enabled and PE_PRESENT flag is set
+	 */
+	optional uint64 cxl_pool_offset = 6;
 }

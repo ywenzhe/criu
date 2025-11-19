@@ -27,6 +27,7 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+#include "cxl-mem-pool.h"
 
 static int page_server_sk = -1;
 
@@ -275,6 +276,70 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	return 0;
 }
 
+/* CXL memory xfer */
+static int write_pages_to_cxl(struct page_xfer *xfer, int pipe_fd, unsigned long len)
+{
+	ssize_t ret;
+	unsigned long remaining = len;
+	char *tmp_buf = NULL;
+	const size_t chunk_size = 2 * 1024 * 1024; /* 2MB chunk for efficiency */
+	uint64_t cxl_offset;
+
+	pr_debug("Writing %lu bytes to CXL memory\n", len);
+
+	/* Allocate temporary buffer for reading from pipe */
+	tmp_buf = xmalloc(chunk_size);
+	if (!tmp_buf) {
+		pr_err("Failed to allocate temporary buffer for CXL write\n");
+		return -1;
+	}
+
+	/* Atomically allocate entire space in CXL memory pool upfront */
+	cxl_offset = cxl_mem_pool_alloc(len);
+	if (cxl_offset == (uint64_t)-1) {
+		pr_err("CXL memory pool exhausted (requested %lu bytes)\n", len);
+		xfree(tmp_buf);
+		return -1;
+	}
+
+	/* Store offset for use in write_pagemap_loc() */
+	xfer->last_cxl_offset = cxl_offset;
+
+	pr_debug("Allocated CXL offset %" PRIu64 " for %lu bytes\n", cxl_offset, len);
+
+	/* Read from pipe and write to CXL memory in chunks */
+	while (remaining > 0) {
+		size_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
+
+		/* Read from page-pipe */
+		ret = read(pipe_fd, tmp_buf, to_read);
+		if (ret < 0) {
+			pr_perror("Failed to read from page-pipe");
+			xfree(tmp_buf);
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("Unexpected EOF from page-pipe (expected %zu more bytes)\n", remaining);
+			xfree(tmp_buf);
+			return -1;
+		}
+
+		/* Write to CXL memory via memcpy to DAX-mapped region */
+		if (cxl_mem_pool_write(cxl_offset, tmp_buf, ret) < 0) {
+			pr_err("Failed to write to CXL memory at offset %" PRIu64 "\n", cxl_offset);
+			xfree(tmp_buf);
+			return -1;
+		}
+
+		cxl_offset += ret;
+		remaining -= ret;
+	}
+
+	xfree(tmp_buf);
+	pr_debug("Successfully wrote %lu bytes to CXL memory\n", len);
+	return 0;
+}
+
 static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 {
 	int ret;
@@ -322,12 +387,23 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 {
 	int ret;
 	PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+	uint64_t nr_pages_val = iov->iov_len / PAGE_SIZE;
 
 	pe.vaddr = encode_pointer(iov->iov_base);
-	pe.nr_pages = iov->iov_len / PAGE_SIZE;
+	/* Set both compat_nr_pages (required) and nr_pages (optional) */
+	pe.compat_nr_pages = (nr_pages_val > UINT32_MAX) ? UINT32_MAX : nr_pages_val;
+	pe.nr_pages = nr_pages_val;
+	pe.has_nr_pages = true;
 	pe.has_flags = true;
 	pe.flags = flags;
-	pe.has_nr_pages = true;
+
+	/* CXL mode: populate cxl_pool_offset field */
+	if (opts.use_cxl_mem && xfer->use_cxl && (flags & PE_PRESENT)) {
+		pe.has_cxl_pool_offset = true;
+		pe.cxl_pool_offset = xfer->last_cxl_offset;
+		pr_debug("Pagemap entry: vaddr=%p, nr_pages=%" PRIu64 ", cxl_offset=%" PRIu64 "\n",
+			 iov->iov_base, pe.nr_pages, pe.cxl_pool_offset);
+	}
 
 	if (flags & PE_PRESENT) {
 		if (opts.auto_dedup && xfer->parent != NULL) {
@@ -361,7 +437,9 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
-	close_image(xfer->pi);
+	/* In CXL mode, xfer->pi is NULL (no pages.img file) */
+	if (xfer->pi)
+		close_image(xfer->pi);
 	close_image(xfer->pmi);
 }
 
@@ -373,9 +451,29 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	if (!xfer->pmi)
 		return -1;
 
-	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
-	if (!xfer->pi)
-		goto err_pmi;
+	/* CXL mode: don't create pages.img file */
+	if (opts.use_cxl_mem) {
+		pr_info("CXL memory mode enabled: pages will be stored in CXL memory pool\n");
+
+		/* Initialize CXL pool if not already done */
+		if (!cxl_pool.initialized) {
+			pr_info("Initializing CXL memory pool: device=%s, size=%zu bytes\n",
+				opts.cxl_dax_dev_path, opts.cxl_mem_pool_size);
+			if (cxl_mem_pool_init(opts.cxl_dax_dev_path, opts.cxl_mem_pool_size) < 0) {
+				pr_err("Failed to initialize CXL memory pool\n");
+				goto err_pmi;
+			}
+		}
+
+		xfer->pi = NULL;
+		xfer->use_cxl = true;
+	} else {
+		/* Traditional mode: create pages.img file */
+		xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
+		if (!xfer->pi)
+			goto err_pmi;
+		xfer->use_cxl = false;
+	}
 
 	/*
 	 * Open page-read for parent images (if it exists). It will
@@ -418,7 +516,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 
 out:
 	xfer->write_pagemap = write_pagemap_loc;
-	xfer->write_pages = write_pages_loc;
+	xfer->write_pages = opts.use_cxl_mem ? write_pages_to_cxl : write_pages_loc;
 	xfer->close = close_page_xfer;
 	return 0;
 
@@ -904,10 +1002,24 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 			flags = ppb_xfer_flags(xfer, ppb);
 
-			if (xfer->write_pagemap(xfer, &iov, flags))
-				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
-				return -1;
+			/*
+			 * CXL mode requires writing pages BEFORE pagemap, because
+			 * write_pages_to_cxl() sets xfer->last_cxl_offset which is
+			 * needed by write_pagemap_loc() to populate cxl_pool_offset.
+			 */
+			if (xfer->use_cxl) {
+				/* CXL mode: pages first, then pagemap */
+				if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+					return -1;
+				if (xfer->write_pagemap(xfer, &iov, flags))
+					return -1;
+			} else {
+				/* Traditional mode: pagemap first, then pages */
+				if (xfer->write_pagemap(xfer, &iov, flags))
+					return -1;
+				if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+					return -1;
+			}
 		}
 	}
 

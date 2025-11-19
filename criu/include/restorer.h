@@ -167,6 +167,12 @@ struct task_restore_args {
 	int vma_ios_fd;
 	struct restore_vma_io *vma_ios;
 	unsigned int vma_ios_n;
+	int use_cxl_restore; /* Whether to read pages from CXL memory instead of file */
+
+	/* CXL memory pool information for restore */
+	char *cxl_dax_dev_path;	     /* Path to CXL DAX device */
+	unsigned long cxl_pool_size;     /* Size of CXL memory pool */
+	unsigned long cxl_dax_dev_path_pos; /* Position for remapping */
 
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
