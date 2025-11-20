@@ -1707,6 +1707,37 @@ static int restore_madv_guard_regions(struct task_restore_args *args)
 	return 0;
 }
 
+static int restore_from_cxl(void *cxl_base, unsigned long cxl_pool_size,
+			    struct restore_vma_io *rio, struct iovec *iovs, int nr)
+{
+	unsigned long total_len = 0;
+	int iov_idx;
+	unsigned long r = 0;
+
+	/* Calculate total length for this read */
+	for (iov_idx = 0; iov_idx < nr; iov_idx++)
+		total_len += iovs[iov_idx].iov_len;
+
+	pr_debug("CXL read from offset %lx: %lu bytes (%d iovs)\n",
+		 (unsigned long)rio->off, total_len, nr);
+
+	if (rio->off + total_len > cxl_pool_size) {
+		pr_err("CXL read out of bounds: offset %lx + len %lu > pool size %lu\n",
+		       (unsigned long)rio->off, total_len, cxl_pool_size);
+		return -1;
+	}
+
+	/* Copy from CXL memory to each iovec */
+	for (iov_idx = 0; iov_idx < nr; iov_idx++) {
+		memcpy(iovs[iov_idx].iov_base,
+		       (char *)cxl_base + rio->off + r,
+		       iovs[iov_idx].iov_len);
+		r += iovs[iov_idx].iov_len;
+	}
+
+	return 0;
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -1926,30 +1957,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		while (nr) {
 			if (args->use_cxl_restore) {
 				/* CXL mode: copy from CXL memory pool */
-				unsigned long total_len = 0;
-				int iov_idx;
-
-				/* Calculate total length for this read */
-				for (iov_idx = 0; iov_idx < nr; iov_idx++)
-					total_len += iovs[iov_idx].iov_len;
-
-				pr_debug("CXL read from offset %lx: %lu bytes (%d iovs)\n",
-					 (unsigned long)rio->off, total_len, nr);
-
-				if (rio->off + total_len > args->cxl_pool_size) {
-					pr_err("CXL read out of bounds: offset %lx + len %lu > pool size %lu\n",
-					       (unsigned long)rio->off, total_len, args->cxl_pool_size);
+				if (restore_from_cxl(cxl_base, args->cxl_pool_size, rio, iovs, nr) < 0)
 					goto core_restore_cxl_cleanup;
-				}
-
-				/* Copy from CXL memory to each iovec */
-				r = 0;
-				for (iov_idx = 0; iov_idx < nr; iov_idx++) {
-					memcpy(iovs[iov_idx].iov_base,
-					       (char *)cxl_base + rio->off + r,
-					       iovs[iov_idx].iov_len);
-					r += iovs[iov_idx].iov_len;
-				}
 
 				/* All iovecs processed */
 				nr = 0;

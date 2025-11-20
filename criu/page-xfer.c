@@ -281,24 +281,16 @@ static int write_pages_to_cxl(struct page_xfer *xfer, int pipe_fd, unsigned long
 {
 	ssize_t ret;
 	unsigned long remaining = len;
-	char *tmp_buf = NULL;
-	const size_t chunk_size = 2 * 1024 * 1024; /* 2MB chunk for efficiency */
 	uint64_t cxl_offset;
+	void *cxl_addr;
+	const size_t chunk_size = 2 * 1024 * 1024; /* 2MB chunk for efficiency */
 
 	pr_debug("Writing %lu bytes to CXL memory\n", len);
-
-	/* Allocate temporary buffer for reading from pipe */
-	tmp_buf = xmalloc(chunk_size);
-	if (!tmp_buf) {
-		pr_err("Failed to allocate temporary buffer for CXL write\n");
-		return -1;
-	}
 
 	/* Atomically allocate entire space in CXL memory pool upfront */
 	cxl_offset = cxl_mem_pool_alloc(len);
 	if (cxl_offset == (uint64_t)-1) {
 		pr_err("CXL memory pool exhausted (requested %lu bytes)\n", len);
-		xfree(tmp_buf);
 		return -1;
 	}
 
@@ -307,35 +299,31 @@ static int write_pages_to_cxl(struct page_xfer *xfer, int pipe_fd, unsigned long
 
 	pr_debug("Allocated CXL offset %" PRIu64 " for %lu bytes\n", cxl_offset, len);
 
-	/* Read from pipe and write to CXL memory in chunks */
+	/* Get direct pointer to CXL memory */
+	cxl_addr = cxl_mem_pool_get_addr(cxl_offset);
+	if (!cxl_addr) {
+		pr_err("Failed to get CXL memory address for offset %" PRIu64 "\n", cxl_offset);
+		return -1;
+	}
+
+	/* Read from pipe directly into CXL memory */
 	while (remaining > 0) {
 		size_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
 
-		/* Read from page-pipe */
-		ret = read(pipe_fd, tmp_buf, to_read);
+		/* Read from page-pipe directly to CXL memory */
+		ret = read(pipe_fd, (char *)cxl_addr + (len - remaining), to_read);
 		if (ret < 0) {
 			pr_perror("Failed to read from page-pipe");
-			xfree(tmp_buf);
 			return -1;
 		}
 		if (ret == 0) {
 			pr_err("Unexpected EOF from page-pipe (expected %zu more bytes)\n", remaining);
-			xfree(tmp_buf);
 			return -1;
 		}
 
-		/* Write to CXL memory via memcpy to DAX-mapped region */
-		if (cxl_mem_pool_write(cxl_offset, tmp_buf, ret) < 0) {
-			pr_err("Failed to write to CXL memory at offset %" PRIu64 "\n", cxl_offset);
-			xfree(tmp_buf);
-			return -1;
-		}
-
-		cxl_offset += ret;
 		remaining -= ret;
 	}
 
-	xfree(tmp_buf);
 	pr_debug("Successfully wrote %lu bytes to CXL memory\n", len);
 	return 0;
 }

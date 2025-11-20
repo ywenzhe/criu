@@ -217,6 +217,18 @@ void cxl_mem_pool_get_stats(uint64_t *used_bytes, uint64_t *total_bytes)
 
 	if (used_bytes)
 		*used_bytes = atomic_load(&cxl_pool.write_offset);
+	
 	if (total_bytes)
 		*total_bytes = cxl_pool.total_size;
+}
+
+void *cxl_mem_pool_get_addr(uint64_t offset)
+{
+       if (!cxl_pool.initialized)
+               return NULL;
+
+       if (offset >= cxl_pool.total_size)
+               return NULL;
+
+       return (char *)cxl_pool.base_addr + offset;
 }

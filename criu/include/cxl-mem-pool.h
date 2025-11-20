@@ -85,4 +85,13 @@ void cxl_mem_pool_reset(void);
  */
 void cxl_mem_pool_get_stats(uint64_t *used_bytes, uint64_t *total_bytes);
 
+/*
+ * Get direct pointer to CXL memory at offset
+ *
+ * @offset: Offset in pool
+ *
+ * Returns: Pointer to memory or NULL if invalid
+ */
+void *cxl_mem_pool_get_addr(uint64_t offset);
+
 #endif /* __CXL_MEM_POOL_H__ */
